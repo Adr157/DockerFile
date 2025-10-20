@@ -1,13 +1,12 @@
-# Dockerfile: ubuntu-xrdp-ngrok-authtoken-ready
+# Dockerfile: ubuntu-xrdp-ngrok-v3
 FROM ubuntu:22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
-ENV NGROK_AUTHTOKEN_DEFAULT=32Welp3eTScxos06FCnQkXay9YB_2vMrSx2JosPzgy7TQ1RLP
-# Preferência: defina NGROK_AUTHTOKEN via runtime env var (Koyeb secret). 
-# Se não definido, usará NGROK_AUTHTOKEN_DEFAULT (que é o token fornecido).
+# Não coloque token direto aqui em repositório público. Defina NGROK_AUTHTOKEN no Koyeb env vars.
+ENV NGROK_AUTHTOKEN=""
 
 RUN apt-get update && apt-get install -y \
-    xfce4 xfce4-goodies xrdp dbus-x11 wget curl unzip sudo iproute2 net-tools jq \
+    xfce4 xfce4-goodies xrdp dbus-x11 wget curl unzip sudo iproute2 net-tools jq ca-certificates \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # criar usuário teste com senha 449090
@@ -20,32 +19,35 @@ RUN sed -i.bak '/^#.*session=.*$/d' /etc/xrdp/startwm.sh || true
 RUN echo "startxfce4" > /home/teste/.xsession
 RUN chown teste:teste /home/teste/.xsession
 
-# baixar ngrok
-RUN wget -q https://bin.equinox.io/c/4VmDzA7iaHb/ngrok-stable-linux-amd64.zip -O /tmp/ngrok.zip \
-    && unzip /tmp/ngrok.zip -d /usr/local/bin/ \
-    && chmod +x /usr/local/bin/ngrok \
-    && rm -f /tmp/ngrok.zip
+# Instalar ngrok v3 (tenta baixar o binário estável v3)
+RUN set -eux; \
+    NGROK_URL="https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-amd64.tgz"; \
+    mkdir -p /tmp/ngrok && \
+    if curl -fsSL "$NGROK_URL" -o /tmp/ngrok/ngrok.tgz; then \
+       tar -xzf /tmp/ngrok/ngrok.tgz -C /tmp/ngrok || true; \
+       mv /tmp/ngrok/ngrok /usr/local/bin/ngrok || true; \
+       chmod +x /usr/local/bin/ngrok || true; \
+       rm -rf /tmp/ngrok; \
+    else \
+       echo "Failed to download ngrok v3 from $NGROK_URL"; \
+    fi
 
 EXPOSE 3389
 
-# entrypoint script
-RUN mkdir -p /opt/startup
+# entrypoint
 COPY <<'EOT' /opt/startup/entrypoint.sh
 #!/usr/bin/env bash
-set -e
+set -euo pipefail
 
-# Decide qual token usar: variável NGROK_AUTHTOKEN tem prioridade, senão usa o default embutido.
-NGROK_TOKEN="${NGROK_AUTHTOKEN:-$NGROK_AUTHTOKEN_DEFAULT}"
-
-if [ -z "$NGROK_TOKEN" ]; then
-  echo "[ERROR] No ngrok token provided. Set NGROK_AUTHTOKEN env var or NGROK_AUTHTOKEN_DEFAULT in the image."
-  exit 1
+# NGROK token priority: runtime env NGROK_AUTHTOKEN
+if [ -z "${NGROK_AUTHTOKEN:-}" ]; then
+  echo "[WARN] NGROK_AUTHTOKEN not set. Set it in Koyeb environment variables for ngrok to auth."
+else
+  echo "Configuring ngrok authtoken..."
+  /usr/local/bin/ngrok config add-authtoken "${NGROK_AUTHTOKEN}" >/dev/null 2>&1 || true
 fi
 
-# Configure ngrok (safe even se já configurado)
-ngrok authtoken "$NGROK_TOKEN" >/dev/null 2>&1 || true
-
-# Start services
+# start required services
 service dbus start || true
 service xrdp start || true
 
@@ -54,38 +56,37 @@ echo "RDP Server started!"
 echo "Username: teste  |  Password: 449090"
 echo "Internal IP (container):"
 ip addr show | grep 'inet ' | grep -v '127.0.0.1' || true
+
+# start ngrok tcp tunnel (background). region can be changed if você preferir (eu usei us)
 echo "Starting ngrok tunnel (tcp -> 3389)..."
+/usr/local/bin/ngrok tcp 3389 --region=us --log=stdout > /var/log/ngrok.log 2>&1 &
 
-# Start ngrok in background (region can be changed: us, eu, ap, au, sa, jp, in)
-ngrok tcp 3389 --region=us --log=stdout > /var/log/ngrok.log 2>&1 &
-
-# Wait a bit for ngrok to start and then query the local API for the tcp endpoint
-# Retry loop to wait for 4040 to be ready
-for i in $(seq 1 12); do
+# wait for ngrok local API then print tcp endpoint
+for i in $(seq 1 15); do
   sleep 1
   if curl --silent --max-time 2 http://127.0.0.1:4040/api/tunnels >/dev/null 2>&1; then
     break
   fi
 done
 
-# Get tcp endpoint from ngrok API
-NGROK_TUNNELS_JSON="$(curl --silent http://127.0.0.1:4040/api/tunnels || true)"
-TCP_ENDPOINT="$(echo "$NGROK_TUNNELS_JSON" | jq -r '.tunnels[] | select(.proto=="tcp") | .public_url' | head -n1)"
-
-if [ -n "$TCP_ENDPOINT" ]; then
-  # public_url comes like tcp://0.tcp.ngrok.io:12345
-  echo "NGROK RDP endpoint: $TCP_ENDPOINT"
-  # Split host/port for convenience
-  HOST="$(echo $TCP_ENDPOINT | sed -E 's|tcp://([^:]+):([0-9]+)|\1|')"
-  PORT="$(echo $TCP_ENDPOINT | sed -E 's|tcp://([^:]+):([0-9]+)|\2|')"
-  echo "Host: $HOST"
-  echo "Port: $PORT"
-  echo "Use these values in your RDP client (username: teste / password: 449090)"
+NG_JSON="$(curl --silent http://127.0.0.1:4040/api/tunnels || true)"
+if [ -n "$NG_JSON" ]; then
+  TCP_URL="$(echo "$NG_JSON" | jq -r '.tunnels[] | select(.proto=="tcp") | .public_url' | head -n1 || true)"
+  if [ -n "$TCP_URL" ] && [ "$TCP_URL" != "null" ]; then
+    echo "NGROK RDP endpoint: $TCP_URL"
+    HOST="$(echo $TCP_URL | sed -E 's|tcp://([^:]+):([0-9]+)|\1|')"
+    PORT="$(echo $TCP_URL | sed -E 's|tcp://([^:]+):([0-9]+)|\2|')"
+    echo "Host: $HOST"
+    echo "Port: $PORT"
+    echo "Use these values in your RDP client (username: teste / password: 449090)"
+  else
+    echo "[WARN] ngrok is running but no tcp tunnel info found. Check /var/log/ngrok.log"
+  fi
 else
-  echo "[WARN] Could not obtain ngrok tcp endpoint from local API. Check /var/log/ngrok.log"
+  echo "[WARN] ngrok local API returned empty. Check /var/log/ngrok.log"
 fi
 
-# keep container running and stream important logs
+# tail logs to keep container alive and allow you to see ngrok/xrdp output
 tail -F /var/log/ngrok.log /var/log/xrdp-sesman.log /var/log/xrdp.log
 EOT
 
